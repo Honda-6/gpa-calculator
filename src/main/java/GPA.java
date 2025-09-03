@@ -1,149 +1,115 @@
 import java.io.IOException;
-import java.util.ArrayList;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.util.List;
-
-
-
-import org.apache.http.HttpEntity;
-import org.apache.http.HttpResponse;
-import org.apache.http.client.methods.HttpGet;
-import org.apache.http.impl.client.CloseableHttpClient;
-import org.apache.http.impl.client.HttpClients;
-import org.apache.http.util.EntityUtils;
-
+import java.util.Optional;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-class CourseData {
-        private double points;
-        private int numOfHours;
-        
-        public CourseData(double points, int numOfHours) {
-            this.points = points;
-            this.numOfHours = numOfHours;
-        }
-        
-        public double getPoints() { 
-            return points; 
-        }
-        
-        public int getNumOfHours() { 
-            return numOfHours; 
-        }
-        
-        @Override
-        public String toString() {
-            return String.format("GPA=%.2f, hours=%d", points, numOfHours);
-        }
+record CourseData(double points, int numOfHours) {
+    @Override
+    public String toString() {
+        return "GPA=%.2f, hours=%d".formatted(points, numOfHours);
+    }
 }
 
 public class GPA {
-    
     private static final String API_URL = "http://193.227.14.58/api/student-courses?size=150&studentId.equals={YOUR ID}&includeWithdraw.equals=true";
     private static final String BEARER_TOKEN = "{YOUR TOKEN}";
-    
-    public static void main(String[] args) {
-        GPA gpaCalculator = new GPA();
-        try {
-            List<CourseData> courses = gpaCalculator.fetchAndProcessCourses();
-            
 
-            System.out.println("Fetched " + courses.size() + " courses:");
+    private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(10))
+            .build();
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+
+    public static void main(String[] args) {
+        var gpaCalculator = new GPA();
+        try {
+            var courses = gpaCalculator.fetchAndProcessCourses();
+
+            System.out.println("Fetched %d courses:".formatted(courses.size()));
             System.out.println("========================================");
-            for (CourseData course : courses) {
-                System.out.println(course);
-            }
-            
-            double finalTotalPoints = 0;
-            int totalHours = 0;
-            for (CourseData course : courses) {
-                if(course.getPoints() != 0) {
-                    finalTotalPoints += course.getPoints() * course.getNumOfHours();
-                    totalHours += course.getNumOfHours();
-                }
-            }
-            
-            System.out.println("\nTotal Points: " + finalTotalPoints);
-            System.out.println("Total Hours: " + totalHours);
-            if (totalHours > 0) {
-                System.out.println("GPA: " + String.format("%.2f", finalTotalPoints / totalHours));
-            }
-            
+            courses.forEach(System.out::println);
+
+            var statistics = calculateStatistics(courses);
+
+            System.out.println("""
+                Total Points: %.2f
+                Total Hours: %d
+                GPA: %.2f
+                """.formatted(statistics.totalPoints(), statistics.totalHours(), statistics.gpa()));
+
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());
             e.printStackTrace();
         }
     }
-    
-    public List<CourseData> fetchAndProcessCourses() throws IOException {
-        List<CourseData> courses = new ArrayList<>();
-        
-        try (CloseableHttpClient httpClient = HttpClients.createDefault()) {
-            
-            HttpGet httpGet = new HttpGet(API_URL);
-            
-            
-            httpGet.setHeader("Authorization", "Bearer " + BEARER_TOKEN);
-            httpGet.setHeader("Content-Type", "application/json");
-            httpGet.setHeader("Accept", "application/json");
-            
-            
-            HttpResponse response = httpClient.execute(httpGet);
-            HttpEntity entity = response.getEntity();
-            
-            if (response.getStatusLine().getStatusCode() == 200) {
-                if (entity != null) {
-                    String jsonResponse = EntityUtils.toString(entity);
-                    courses = processCourseData(jsonResponse);
-                }
-            } else {
-                String errorBody = entity != null ? EntityUtils.toString(entity) : "No response body";
-                throw new RuntimeException("HTTP request failed with status code: " + 
-                        response.getStatusLine().getStatusCode() + ", body: " + errorBody);
-            }
-        }
-        
-        return courses;
+
+    record Statistics(double totalPoints, int totalHours, double gpa) {}
+
+    private static Statistics calculateStatistics(List<CourseData> courses) {
+        var totalPoints = courses.stream()
+                .filter(course -> course.points() != 0)
+                .mapToDouble(course -> course.points() * course.numOfHours())
+                .sum();
+
+        var totalHours = courses.stream()
+                .filter(course -> course.points() != 0)
+                .mapToInt(CourseData::numOfHours)
+                .sum();
+
+        var gpa = totalPoints / totalHours;
+        return new Statistics(totalPoints, totalHours, gpa);
     }
-    
+
+    public List<CourseData> fetchAndProcessCourses() throws IOException, InterruptedException {
+        var request = HttpRequest.newBuilder()
+                .uri(URI.create(API_URL))
+                .header("Authorization", "Bearer " + BEARER_TOKEN)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .timeout(Duration.ofSeconds(30))
+                .GET()
+                .build();
+
+        var response = HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
+
+        return switch (response.statusCode()) {
+            case 200 -> processCourseData(response.body());
+            default -> throw new RuntimeException(
+                "HTTP request failed with status code: %d, body: %s"
+                    .formatted(response.statusCode(), response.body())
+            );
+        };
+    }
+
     private List<CourseData> processCourseData(String jsonResponse) throws IOException {
-        List<CourseData> courses = new ArrayList<>();
-        ObjectMapper mapper = new ObjectMapper();
-        JsonNode rootNode = mapper.readTree(jsonResponse);
-        
-        if (rootNode.isArray()) {
-            for (JsonNode courseNode : rootNode) {
-                CourseData courseData = extractCourseInfo(courseNode);
-                if (courseData != null) {
-                    courses.add(courseData);
-                }
-            }
-        } else {
+        var rootNode = OBJECT_MAPPER.readTree(jsonResponse);
+        if (!rootNode.isArray()) {
             throw new IllegalArgumentException("Expected JSON array but got: " + rootNode.getNodeType());
         }
-        
-        return courses;
+        return java.util.stream.StreamSupport.stream(rootNode.spliterator(), false)
+                .map(this::extractCourseInfo)
+                .flatMap(Optional::stream)
+                .toList();
     }
-    
-    private CourseData extractCourseInfo(JsonNode courseNode) {
+
+    private Optional<CourseData> extractCourseInfo(JsonNode courseNode) {
         try {
-            
-            double points = courseNode.has("points") ? courseNode.get("points").asDouble() : 0.0;
-            
-            int numOfHours = 0;
-            if (courseNode.has("course") && courseNode.get("course").isObject()) {
-                JsonNode courseObject = courseNode.get("course");
-                numOfHours = courseObject.has("numOfHours") ? 
-                        courseObject.get("numOfHours").asInt() : 0;
-            }
-            
-            return new CourseData(points, numOfHours);
-            
+            var points = courseNode.has("points") ? courseNode.get("points").asDouble() : 0.0;
+            var numOfHours = Optional.ofNullable(courseNode.get("course"))
+                    .filter(JsonNode::isObject)
+                    .map(courseObject -> courseObject.get("numOfHours"))
+                    .map(JsonNode::asInt)
+                    .orElse(0);
+            return Optional.of(new CourseData(points, numOfHours));
         } catch (Exception e) {
             System.err.println("Error extracting course info: " + e.getMessage());
-            return null;
+            return Optional.empty();
         }
     }
-    
 }
